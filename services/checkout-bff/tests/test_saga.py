@@ -23,14 +23,21 @@ def limpiar_almacenes():
 def test_checkout_exito_completo():
     """Caso 1: Todos los pasos responden OK -> CONFIRMADO con 4 pasos."""
     def mock_handler(request: httpx.Request) -> httpx.Response:
+        import json
         path = request.url.path
         if "/v1/productos/CAFE-500G" in path:
             return httpx.Response(200, json={"sku": "CAFE-500G", "nombre": "Café", "precio_cop": 20000, "publicado": True})
         if "/v1/reservas" in path:
             return httpx.Response(201, json={"reserva_id": "RES-101", "sku": "CAFE-500G", "cantidad": 2})
         if "/v1/pedidos" in path:
+            body = json.loads(request.read())
+            assert isinstance(body["monto_cop"], int)
+            assert body["monto_cop"] == 40000
             return httpx.Response(201, json={"pedido_id": "PED-202", "estado": "CREADO"})
         if "/v1/pagos" in path:
+            body = json.loads(request.read())
+            assert isinstance(body["monto_cop"], int)
+            assert body["monto_cop"] == 40000
             return httpx.Response(201, json={"pago_id": "PAG-303", "estado": "APROBADO"})
         return httpx.Response(404)
 

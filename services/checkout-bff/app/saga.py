@@ -39,7 +39,7 @@ async def orquestar_checkout(
     # -------------------------------------------------------------
     # PASO 1: Catálogo (Validar producto y precio)
     # -------------------------------------------------------------
-    monto_cop: float = 0.0
+    monto_cop: int = 0
     try:
         url_cat = f"{str(settings.catalogo_url).rstrip('/')}/v1/productos/{payload.sku}"
         resp_cat = await client.get(url_cat, timeout=settings.timeout_catalogo_seconds)
@@ -47,11 +47,12 @@ async def orquestar_checkout(
             data_cat = resp_cat.json()
             if data_cat.get("publicado") is True:
                 precio_cop = float(data_cat.get("precio_cop", 0))
-                monto_cop = precio_cop * payload.cantidad
+                # Redondeo explícito a entero según contrato de eventos de PiShop (ej. 56000)
+                monto_cop = int(round(precio_cop * payload.cantidad))
                 pasos.append(PasoResultado(
                     paso="catalogo",
                     resultado="OK",
-                    detalle=f"Producto {payload.sku} verificado y publicado (precio: {precio_cop})"
+                    detalle=f"Producto {payload.sku} verificado y publicado (precio: {precio_cop}, monto: {monto_cop})"
                 ))
             else:
                 saga_exitosa = False
