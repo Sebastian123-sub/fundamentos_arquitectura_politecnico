@@ -84,7 +84,7 @@ services:
     <<: *servicio
     build: ./services/checkout-bff
     ports: ["8081:8080"]
-    environment: {<<: *env, PISHOP_SERVICE_NAME: checkout-bff, PISHOP_HTTP_PORT: "8080"}
+    environment: {<<: *env, PISHOP_SERVICE_NAME: checkout-bff, PISHOP_HTTP_PORT: "8080", PISHOP_CATALOGO_URL: http://catalogo-service:8001, PISHOP_INVENTARIO_URL: http://inventario-service:8002, PISHOP_PEDIDOS_URL: http://pedidos-service:8003, PISHOP_PAGOS_URL: http://pagos-service:8004}
 
   api-publica:
     <<: *servicio
