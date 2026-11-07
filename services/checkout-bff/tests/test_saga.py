@@ -120,8 +120,9 @@ def test_checkout_falla_paso_3_pedidos_caido_compensa_inventario():
 
 
 def test_checkout_falla_paso_4_pago_rechazado_compensa_en_orden_inverso():
-    """Caso 2.4: Pagos responde RECHAZADO -> FALLIDO, compensa primero pedidos (cancelar) y luego inventario (liberar)."""
+    """Caso 2.4: Pagos responde RECHAZADO -> FALLIDO, NO reembolsa, y compensa pedidos (cancelar) e inventario (liberar) en orden inverso."""
     orden_compensaciones = []
+    llamadas_reembolso = []
 
     def mock_handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -135,6 +136,9 @@ def test_checkout_falla_paso_4_pago_rechazado_compensa_en_orden_inverso():
             return httpx.Response(200, json={"pago_id": "PAG-111", "estado": "RECHAZADO"})
 
         # Compensaciones
+        if "/reembolso" in path:
+            llamadas_reembolso.append(path)
+            return httpx.Response(200, json={"estado": "REEMBOLSADO"})
         if "/v1/pedidos/PED-777/cancelar" in path:
             orden_compensaciones.append("pedidos_cancelar")
             return httpx.Response(200, json={"estado": "CANCELADO"})
@@ -151,6 +155,13 @@ def test_checkout_falla_paso_4_pago_rechazado_compensa_en_orden_inverso():
         assert resp.status_code == 200
         data = resp.json()
         assert data["estado"] == "FALLIDO"
+
+        # Verificar que NO se llamó a reembolso porque el pago fue RECHAZADO
+        assert len(llamadas_reembolso) == 0
+
+        # Verificar que el detalle del paso pagos aclare que no requiere reembolso
+        paso_pago = next(p for p in data["pasos"] if p["paso"] == "pagos")
+        assert "no requiere reembolso" in paso_pago["detalle"]
 
         # Verificar orden inverso estricto de compensaciones: pedidos_cancelar -> inventario_liberar
         assert orden_compensaciones == ["pedidos_cancelar", "inventario_liberar"]

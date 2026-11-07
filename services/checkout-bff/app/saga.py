@@ -32,6 +32,7 @@ async def orquestar_checkout(
     pedido_id = correlation_id
     reserva_id: Optional[str] = None
     pago_id: Optional[str] = None
+    pago_requiere_reembolso = False
     pasos: List[PasoResultado] = []
     saga_exitosa = True
 
@@ -185,20 +186,31 @@ async def orquestar_checkout(
                 pago_id = str(data_pag.get("pago_id", f"pag-{uuid.uuid4().hex[:6]}"))
                 estado_pago = str(data_pag.get("estado", "")).upper()
                 if estado_pago == "APROBADO":
+                    pago_requiere_reembolso = True
                     pasos.append(PasoResultado(
                         paso="pagos",
                         resultado="OK",
                         detalle=f"Pago {pago_id} APROBADO"
                     ))
-                else:
+                elif estado_pago == "PENDIENTE":
                     saga_exitosa = False
+                    pago_requiere_reembolso = True
                     pasos.append(PasoResultado(
                         paso="pagos",
                         resultado="FALLIDO",
-                        detalle=f"Pago {pago_id} no aprobado (estado: {estado_pago})"
+                        detalle=f"Pago {pago_id} en estado PENDIENTE (se trata como fallo y requiere reembolso/cancelación)"
+                    ))
+                else:
+                    saga_exitosa = False
+                    pago_requiere_reembolso = False
+                    pasos.append(PasoResultado(
+                        paso="pagos",
+                        resultado="FALLIDO",
+                        detalle=f"Pago {pago_id} RECHAZADO (no cobrado, no requiere reembolso)"
                     ))
             else:
                 saga_exitosa = False
+                pago_requiere_reembolso = False
                 pasos.append(PasoResultado(
                     paso="pagos",
                     resultado="FALLIDO",
@@ -206,6 +218,7 @@ async def orquestar_checkout(
                 ))
         except Exception as exc:
             saga_exitosa = False
+            pago_requiere_reembolso = False
             pasos.append(PasoResultado(
                 paso="pagos",
                 resultado="FALLIDO",
@@ -216,8 +229,8 @@ async def orquestar_checkout(
     # COMPENSACIONES (en orden inverso ante cualquier fallo)
     # -------------------------------------------------------------
     if not saga_exitosa:
-        # Compensación 4 -> Reembolsar si se llegó a cobrar
-        if pago_id:
+        # Compensación 4 -> Reembolsar si se cobró o quedó pendiente
+        if pago_id and pago_requiere_reembolso:
             try:
                 url_reemb = f"{str(settings.pagos_url).rstrip('/')}/v1/pagos/{pago_id}/reembolso"
                 headers_reemb = {"Idempotency-Key": f"{idempotency_key}-reembolso"}
