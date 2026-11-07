@@ -334,3 +334,166 @@ def test_obtener_estado_checkout_existente_y_no_encontrado():
         data_404 = resp_404.json()
         assert "detalle" in data_404
         assert data_404.get("codigo") == "PEDIDO_NO_ENCONTRADO"
+
+
+def test_checkout_falla_compensacion_continua_con_demas():
+    """Resiliencia: Si una compensación falla (HTTP 500), no interrumpe las demás y la refleja como FALLIDO."""
+    compensaciones_ejecutadas = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "/v1/productos" in path:
+            return httpx.Response(200, json={"sku": "PROD-COMP-FALLA", "precio_cop": 10000, "publicado": True})
+        if request.method == "POST" and path == "/v1/reservas":
+            return httpx.Response(201, json={"reserva_id": "RES-FALLA-COMP"})
+        if request.method == "POST" and path == "/v1/pedidos":
+            return httpx.Response(201, json={"pedido_id": "PED-FALLA-COMP", "estado": "CREADO"})
+        if request.method == "POST" and path == "/v1/pagos":
+            # Pagos falla por timeout
+            raise httpx.ReadTimeout("Timeout en pasarela de pagos")
+
+        # Compensación de pedidos falla con HTTP 500
+        if "/v1/pedidos/PED-FALLA-COMP/cancelar" in path:
+            compensaciones_ejecutadas.append("pedidos_cancelar")
+            return httpx.Response(500, json={"detalle": "Error interno en servicio de pedidos"})
+
+        # Compensación de inventario debe ejecutarse igualmente
+        if "/v1/reservas/RES-FALLA-COMP/liberar" in path:
+            compensaciones_ejecutadas.append("inventario_liberar")
+            return httpx.Response(200, json={"estado": "LIBERADO"})
+
+        return httpx.Response(404)
+
+    with TestClient(app) as c:
+        app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
+        payload = {"cliente_id": "CLI-01", "sku": "PROD-COMP-FALLA", "cantidad": 1, "medio_pago": "tarjeta"}
+        resp = c.post("/v1/checkout", json=payload, headers={"Idempotency-Key": "key-comp-falla"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["estado"] == "FALLIDO"
+
+        # Se ejecutaron ambas compensaciones a pesar del fallo en la primera
+        assert compensaciones_ejecutadas == ["pedidos_cancelar", "inventario_liberar"]
+
+        paso_cancelar = next(p for p in data["pasos"] if p["paso"] == "pedidos_cancelar")
+        assert paso_cancelar["resultado"] == "FALLIDO"
+
+        paso_liberar = next(p for p in data["pasos"] if p["paso"] == "inventario_liberar")
+        assert paso_liberar["resultado"] == "COMPENSADO"
+
+
+def test_checkout_timeout_en_catalogo():
+    """Resiliencia: Timeout en catálogo no ejecuta compensaciones posteriores y marca FALLIDO."""
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("Catálogo no responde")
+
+    with TestClient(app) as c:
+        app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
+        payload = {"cliente_id": "CLI-01", "sku": "CAFE", "cantidad": 1, "medio_pago": "tarjeta"}
+        resp = c.post("/v1/checkout", json=payload, headers={"Idempotency-Key": "key-timeout-cat"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["estado"] == "FALLIDO"
+        assert len(data["pasos"]) == 1
+        assert data["pasos"][0]["paso"] == "catalogo"
+        assert data["pasos"][0]["resultado"] == "FALLIDO"
+
+
+def test_checkout_timeout_en_inventario():
+    """Resiliencia: Timeout en inventario marca FALLIDO y no dispara liberación (reserva no creada)."""
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "/v1/productos" in path:
+            return httpx.Response(200, json={"sku": "CAFE", "precio_cop": 10000, "publicado": True})
+        if "/v1/reservas" in path:
+            raise httpx.ReadTimeout("Inventario no responde")
+        return httpx.Response(404)
+
+    with TestClient(app) as c:
+        app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
+        payload = {"cliente_id": "CLI-01", "sku": "CAFE", "cantidad": 1, "medio_pago": "tarjeta"}
+        resp = c.post("/v1/checkout", json=payload, headers={"Idempotency-Key": "key-timeout-inv"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["estado"] == "FALLIDO"
+        nombres_pasos = [p["paso"] for p in data["pasos"]]
+        assert nombres_pasos == ["catalogo", "inventario"]
+        assert data["pasos"][1]["resultado"] == "FALLIDO"
+
+
+def test_checkout_timeout_en_pagos_compensa_pedidos_e_inventario():
+    """Resiliencia: Timeout en pagos compensa pedidos y luego inventario en orden inverso."""
+    orden_compensaciones = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "/v1/productos" in path:
+            return httpx.Response(200, json={"sku": "CAFE", "precio_cop": 10000, "publicado": True})
+        if request.method == "POST" and path == "/v1/reservas":
+            return httpx.Response(201, json={"reserva_id": "RES-TIMEOUT-PAG"})
+        if request.method == "POST" and path == "/v1/pedidos":
+            return httpx.Response(201, json={"pedido_id": "PED-TIMEOUT-PAG", "estado": "CREADO"})
+        if request.method == "POST" and path == "/v1/pagos":
+            raise httpx.ReadTimeout("Pagos timeout")
+
+        if "/v1/pedidos/PED-TIMEOUT-PAG/cancelar" in path:
+            orden_compensaciones.append("pedidos_cancelar")
+            return httpx.Response(200, json={"estado": "CANCELADO"})
+        if "/v1/reservas/RES-TIMEOUT-PAG/liberar" in path:
+            orden_compensaciones.append("inventario_liberar")
+            return httpx.Response(200, json={"estado": "LIBERADO"})
+
+        return httpx.Response(404)
+
+    with TestClient(app) as c:
+        app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
+        payload = {"cliente_id": "CLI-01", "sku": "CAFE", "cantidad": 1, "medio_pago": "tarjeta"}
+        resp = c.post("/v1/checkout", json=payload, headers={"Idempotency-Key": "key-timeout-pag"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["estado"] == "FALLIDO"
+        assert orden_compensaciones == ["pedidos_cancelar", "inventario_liberar"]
+
+
+def test_checkout_pago_pendiente_trata_como_fallo_y_compensa():
+    """Resiliencia: Pago PENDIENTE se trata como fallo y dispara compensación completa (reembolso, cancelación, liberación)."""
+    orden_compensaciones = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "/v1/productos" in path:
+            return httpx.Response(200, json={"sku": "CAFE", "precio_cop": 10000, "publicado": True})
+        if request.method == "POST" and path == "/v1/reservas":
+            return httpx.Response(201, json={"reserva_id": "RES-PEND"})
+        if request.method == "POST" and path == "/v1/pedidos":
+            return httpx.Response(201, json={"pedido_id": "PED-PEND", "estado": "CREADO"})
+        if request.method == "POST" and path == "/v1/pagos":
+            return httpx.Response(201, json={"pago_id": "PAG-PEND", "estado": "PENDIENTE"})
+
+        # Compensaciones en orden inverso
+        if "/v1/pagos/PAG-PEND/reembolso" in path:
+            orden_compensaciones.append("pagos_reembolso")
+            return httpx.Response(200, json={"estado": "REEMBOLSADO"})
+        if "/v1/pedidos/PED-PEND/cancelar" in path:
+            orden_compensaciones.append("pedidos_cancelar")
+            return httpx.Response(200, json={"estado": "CANCELADO"})
+        if "/v1/reservas/RES-PEND/liberar" in path:
+            orden_compensaciones.append("inventario_liberar")
+            return httpx.Response(200, json={"estado": "LIBERADO"})
+
+        return httpx.Response(404)
+
+    with TestClient(app) as c:
+        app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
+        payload = {"cliente_id": "CLI-01", "sku": "CAFE", "cantidad": 1, "medio_pago": "tarjeta"}
+        resp = c.post("/v1/checkout", json=payload, headers={"Idempotency-Key": "key-pago-pend"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["estado"] == "FALLIDO"
+
+        paso_pago = next(p for p in data["pasos"] if p["paso"] == "pagos")
+        assert paso_pago["resultado"] == "FALLIDO"
+        assert "PENDIENTE" in paso_pago["detalle"]
+
+        # Verifica orden inverso de las 3 compensaciones
+        assert orden_compensaciones == ["pagos_reembolso", "pedidos_cancelar", "inventario_liberar"]
