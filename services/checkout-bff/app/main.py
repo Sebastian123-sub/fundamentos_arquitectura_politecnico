@@ -1,22 +1,25 @@
 """Servicio Checkout BFF (P06 - PiShop Cloud).
 
-Servicio compuesto que orquesta el flujo de compra (saga por orquestación)
-entre catálogo, inventario, pedidos y pagos.
+Servicio compuesto que implementa el patrón Saga por Orquestación,
+agregador BFF para vista móvil (vitrina) y manejo estricto de idempotencia.
 """
+import asyncio
 import socket
 import uuid
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Response, status
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
+from app.saga import orquestar_checkout
 from app.schemas import (
     CheckoutRequest,
     CheckoutResponse,
-    PasoResultado,
+    ErrorResponse,
     VitrinaItem,
-    VitrinaResponse,
 )
 from app.settings import get_settings
 
@@ -24,40 +27,88 @@ settings = get_settings()
 INSTANCE_ID = f"{settings.service_name}-{uuid.uuid4().hex[:5]}"
 HOST = socket.gethostname()
 
-# Estado de ciclo de vida
+# Estado del ciclo de vida
 ESTADO = {"arranco": False, "config_version": 0}
 
-# Almacenes en memoria para pedidos, estado e idempotencia
-PEDIDOS_STORE: Dict[str, CheckoutResponse] = {}
-IDEMPOTENCIA_CACHE: Dict[str, CheckoutResponse] = {}
+# Almacenes en memoria para idempotencia y estado de pedidos
+IDEMPOTENCIA_STORE: Dict[str, CheckoutResponse] = {}
+PEDIDOS_ESTADO_STORE: Dict[str, CheckoutResponse] = {}
 
-# Cliente HTTP reutilizable con timeout explícito (Factor y criterio Semana 3)
-http_client: Optional[httpx.AsyncClient] = None
+# Control de concurrencia: locks por clave de idempotencia
+_locks: Dict[str, asyncio.Lock] = {}
+_master_lock = asyncio.Lock()
+
+
+async def _obtener_lock(clave: str) -> asyncio.Lock:
+    """Retorna un lock específico para la clave de idempotencia protegiendo contra race conditions."""
+    async with _master_lock:
+        if clave not in _locks:
+            _locks[clave] = asyncio.Lock()
+        return _locks[clave]
+
+
+# Cliente HTTP global del proceso
+_http_client: Optional[httpx.AsyncClient] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client
-    # Timeout explícito externalizado desde settings
-    http_client = httpx.AsyncClient(timeout=settings.http_timeout_seconds)
+    global _http_client
+    if not hasattr(app.state, "http_client") or app.state.http_client is None:
+        _http_client = httpx.AsyncClient(timeout=settings.http_timeout_seconds)
+        app.state.http_client = _http_client
     ESTADO["arranco"] = True
     yield
-    if http_client:
-        await http_client.aclose()
+    if _http_client:
+        await _http_client.aclose()
+        _http_client = None
     ESTADO["arranco"] = False
 
 
 app = FastAPI(
     title=settings.service_name,
     version="1.0.0",
-    description="Checkout BFF - Orquestador de Saga y agregador para PiShop Cloud",
+    description="Checkout BFF - Orquestador Saga y Agregador Móvil",
     lifespan=lifespan,
 )
 
 
-# ==========================================
+def get_http_client() -> httpx.AsyncClient:
+    """Permite inyectar dobles de prueba (mock transport) o usar el cliente del lifespan."""
+    if hasattr(app.state, "http_client") and app.state.http_client:
+        return app.state.http_client
+    if _http_client:
+        return _http_client
+    return httpx.AsyncClient(timeout=settings.http_timeout_seconds)
+
+
+# =============================================================
+# MANEJADORES DE ERROR UNIFORMES ({"detalle": "...", "codigo": "..."})
+# =============================================================
+
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    codigo = "RECURSO_NO_ENCONTRADO" if exc.status_code == 404 else "ERROR_HTTP"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detalle": str(exc.detail), "codigo": codigo},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detalle": f"Datos de petición inválidos: {str(exc.errors())}",
+            "codigo": "VALIDACION_INVALIDA",
+        },
+    )
+
+
+# =============================================================
 # SONDAS DE SALUD (Semana 4)
-# ==========================================
+# =============================================================
 
 @app.get("/health/live", tags=["salud"])
 def live() -> dict[str, str]:
@@ -74,134 +125,142 @@ def startup(resp: Response) -> dict[str, bool]:
 
 @app.get("/health/ready", tags=["salud"])
 def ready(resp: Response) -> dict[str, object]:
-    """Verifica dependencias y ciclo de vida."""
+    """Verifica dependencias y versión de configuración."""
     ok = ESTADO["arranco"] and (ESTADO["config_version"] > 0 or settings.app_env == "dev")
     if not ok:
         resp.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return {"ready": ok, "config_version": ESTADO["config_version"], "instance": INSTANCE_ID}
 
 
-# ==========================================
+# =============================================================
 # ENDPOINTS DE NEGOCIO (Contrato P06)
-# ==========================================
+# =============================================================
 
 @app.post(
     "/v1/checkout",
     response_model=CheckoutResponse,
     status_code=status.HTTP_200_OK,
+    responses={
+        422: {"model": ErrorResponse, "description": "Validación inválida o falta Idempotency-Key"},
+    },
     tags=["checkout"],
 )
 async def checkout(
     payload: CheckoutRequest,
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
-) -> CheckoutResponse:
-    """Orquesta la saga de checkout:
-
-    1. Catálogo: Valida producto y precio.
-    2. Inventario: Reserva unidades requeridas.
-    3. Pedidos: Registra el pedido.
-    4. Pagos: Ejecuta el cobro.
-
-    Si falla algún paso, ejecuta compensaciones en orden inverso.
+):
+    """Inicia la saga de checkout coordinando catálogo, inventario, pedidos y pagos.
+    
+    Exige obligatoriamente la cabecera `Idempotency-Key`. Peticiones repetidas con la misma
+    clave devuelven exactamente la misma respuesta sin volver a ejecutar los pasos.
     """
-    # Verificación de idempotencia
-    if idempotency_key and idempotency_key in IDEMPOTENCIA_CACHE:
-        return IDEMPOTENCIA_CACHE[idempotency_key]
+    # Validación estricta de Idempotency-Key
+    if not idempotency_key or not idempotency_key.strip():
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "detalle": "La cabecera 'Idempotency-Key' es obligatoria para el checkout",
+                "codigo": "IDEMPOTENCY_KEY_REQUERIDA",
+            },
+        )
 
-    pedido_id = f"PED-{uuid.uuid4().hex[:8].upper()}"
-    reserva_id: Optional[str] = None
-    pago_id: Optional[str] = None
-    pasos: List[PasoResultado] = []
+    clave = idempotency_key.strip()
+    lock = await _obtener_lock(clave)
 
-    saga_exitosa = True
+    async with lock:
+        # Si ya fue procesado, retornar la respuesta en caché sin reejecutar
+        if clave in IDEMPOTENCIA_STORE:
+            return IDEMPOTENCIA_STORE[clave]
 
-    # 1. Catálogo: validar producto
-    try:
-        paso_cat = PasoResultado(paso="catalogo", resultado="OK", detalle=f"Producto {payload.sku} verificado")
-        pasos.append(paso_cat)
-    except Exception as e:
-        pasos.append(PasoResultado(paso="catalogo", resultado="FALLIDO", detalle=str(e)))
-        saga_exitosa = False
+        client = get_http_client()
+        resultado = await orquestar_checkout(
+            payload=payload,
+            idempotency_key=clave,
+            client=client,
+            settings=settings,
+        )
 
-    # 2. Inventario: reservar stock
-    if saga_exitosa:
-        try:
-            reserva_id = f"RES-{uuid.uuid4().hex[:6].upper()}"
-            pasos.append(PasoResultado(paso="inventario", resultado="OK", detalle=f"Reserva {reserva_id} generada"))
-        except Exception as e:
-            pasos.append(PasoResultado(paso="inventario", resultado="FALLIDO", detalle=str(e)))
-            saga_exitosa = False
+        # Almacenar resultado para idempotencia y consulta de estado
+        IDEMPOTENCIA_STORE[clave] = resultado
+        PEDIDOS_ESTADO_STORE[resultado.pedido_id] = resultado
 
-    # 3. Pedidos: crear pedido
-    if saga_exitosa:
-        try:
-            pasos.append(PasoResultado(paso="pedidos", resultado="OK", detalle=f"Pedido {pedido_id} creado en estado CREADO"))
-        except Exception as e:
-            pasos.append(PasoResultado(paso="pedidos", resultado="FALLIDO", detalle=str(e)))
-            saga_exitosa = False
-
-    # 4. Pagos: realizar cobro
-    if saga_exitosa:
-        try:
-            pago_id = f"PAG-{uuid.uuid4().hex[:6].upper()}"
-            pasos.append(PasoResultado(paso="pagos", resultado="OK", detalle=f"Pago {pago_id} procesado exitosamente"))
-        except Exception as e:
-            pasos.append(PasoResultado(paso="pagos", resultado="FALLIDO", detalle=str(e)))
-            saga_exitosa = False
-
-    # COMPENSACIONES si hubo algún fallo
-    if not saga_exitosa:
-        # Compensar pedido si llegó a crearse
-        if pedido_id:
-            pasos.append(PasoResultado(paso="pedidos_compensacion", resultado="COMPENSADO", detalle=f"Pedido {pedido_id} cancelado"))
-        # Compensar reserva de inventario
-        if reserva_id:
-            pasos.append(PasoResultado(paso="inventario_compensacion", resultado="COMPENSADO", detalle=f"Reserva {reserva_id} liberada"))
-
-    estado_final = "CONFIRMADO" if saga_exitosa else "FALLIDO"
-    respuesta = CheckoutResponse(pedido_id=pedido_id, estado=estado_final, pasos=pasos)
-
-    # Registrar en memoria
-    PEDIDOS_STORE[pedido_id] = respuesta
-    if idempotency_key:
-        IDEMPOTENCIA_CACHE[idempotency_key] = respuesta
-
-    return respuesta
+        return resultado
 
 
 @app.get(
     "/v1/checkout/{pedido_id}/estado",
     response_model=CheckoutResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "Pedido no encontrado"},
+    },
     tags=["checkout"],
 )
-def obtener_estado_checkout(pedido_id: str) -> CheckoutResponse:
-    """Consulta el estado actual de un checkout/pedido por su ID."""
-    if pedido_id in PEDIDOS_STORE:
-        return PEDIDOS_STORE[pedido_id]
+def obtener_estado_checkout(pedido_id: str):
+    """Consulta el estado del checkout y el detalle de pasos ejecutados para un pedido."""
+    if pedido_id in PEDIDOS_ESTADO_STORE:
+        return PEDIDOS_ESTADO_STORE[pedido_id]
 
-    # Si se consulta un pedido simulado
-    return CheckoutResponse(
-        pedido_id=pedido_id,
-        estado="CONFIRMADO",
-        pasos=[
-            PasoResultado(paso="catalogo", resultado="OK"),
-            PasoResultado(paso="inventario", resultado="OK"),
-            PasoResultado(paso="pedidos", resultado="OK"),
-            PasoResultado(paso="pagos", resultado="OK"),
-        ],
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content={
+            "detalle": f"Pedido con ID '{pedido_id}' no encontrado",
+            "codigo": "PEDIDO_NO_ENCONTRADO",
+        },
     )
 
 
 @app.get(
     "/v1/vitrina",
-    response_model=VitrinaResponse,
+    response_model=List[VitrinaItem],
     tags=["vitrina"],
 )
-def obtener_vitrina() -> VitrinaResponse:
-    """Agrega productos publicados de catálogo con stock de inventario para vista móvil."""
-    productos_vitrina = [
-        VitrinaItem(sku="CAFE-500G", nombre="Café Especial 500g", precio_cop=35000.0, stock_disponible=25, categoria="Bebidas"),
-        VitrinaItem(sku="TAZA-CERAMICA", nombre="Taza Cerámica PiShop", precio_cop=18000.0, stock_disponible=50, categoria="Accesorios"),
-        VitrinaItem(sku="CAMISETA-DEV", nombre="Camiseta Dev Algodón", precio_cop=45000.0, stock_disponible=12, categoria="Ropa"),
-    ]
-    return VitrinaResponse(items=productos_vitrina, total=len(productos_vitrina))
+async def obtener_vitrina():
+    """Agregador BFF para vista móvil:
+
+    Consulta catálogo (filtrando publicados) y complementa con stock de inventario.
+    Si inventario falla para un SKU, se degrada ese ítem asignando stock 0 sin tumbar la vitrina.
+    """
+    client = get_http_client()
+    url_cat = f"{str(settings.catalogo_url).rstrip('/')}/v1/productos"
+
+    productos_publicados = []
+    try:
+        resp_cat = await client.get(url_cat, timeout=settings.timeout_catalogo_seconds)
+        if resp_cat.status_code == 200:
+            data_cat = resp_cat.json()
+            items = data_cat.get("items", []) if isinstance(data_cat, dict) else data_cat
+            productos_publicados = [p for p in items if p.get("publicado") is True]
+    except Exception:
+        # Si catálogo no responde, la vitrina responde lista vacía degradada
+        return []
+
+    vitrina_items: List[VitrinaItem] = []
+    for prod in productos_publicados:
+        sku = prod.get("sku", "")
+        nombre = prod.get("nombre", "")
+        precio = float(prod.get("precio_cop", 0))
+        stock_disp = 0
+
+        # Consulta de stock resiliente (falla parcial -> degradación graciosa)
+        try:
+            url_inv = f"{str(settings.inventario_url).rstrip('/')}/v1/stock/{sku}"
+            resp_inv = await client.get(url_inv, timeout=settings.timeout_inventario_seconds)
+            if resp_inv.status_code == 200:
+                data_inv = resp_inv.json()
+                total_stock = data_inv.get("cantidad", 0)
+                reservado = data_inv.get("reservado", 0)
+                stock_disp = max(0, total_stock - reservado)
+        except Exception:
+            # Degradación controlada: el fallo de stock de un ítem no tumba la vitrina móvil
+            stock_disp = 0
+
+        vitrina_items.append(
+            VitrinaItem(
+                sku=sku,
+                nombre=nombre,
+                precio_cop=precio,
+                stock_disponible=stock_disp,
+            )
+        )
+
+    return vitrina_items
