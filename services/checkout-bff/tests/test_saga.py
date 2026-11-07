@@ -3,7 +3,7 @@ import pytest
 import httpx
 from fastapi.testclient import TestClient
 
-from app.main import app, IDEMPOTENCIA_STORE, PEDIDOS_ESTADO_STORE
+from app.main import app, IDEMPOTENCIA_STORE, PEDIDOS_ESTADO_STORE, _locks
 
 
 @pytest.fixture(autouse=True)
@@ -11,8 +11,12 @@ def limpiar_almacenes():
     """Limpia la memoria antes de cada prueba para garantizar aislamiento."""
     IDEMPOTENCIA_STORE.clear()
     PEDIDOS_ESTADO_STORE.clear()
+    _locks.clear()
     app.state.http_client = None
     yield
+    IDEMPOTENCIA_STORE.clear()
+    PEDIDOS_ESTADO_STORE.clear()
+    _locks.clear()
     app.state.http_client = None
 
 
@@ -228,6 +232,57 @@ def test_checkout_idempotencia_misma_clave():
         assert data1 == data2
         assert data1["pedido_id"] == "PED-UNICO"
         assert contador_llamadas_pagos == 1  # No se volvió a ejecutar el pago
+
+
+def test_checkout_concurrencia_idempotencia():
+    """Caso 4.2: Dos llamadas concurrentes con la misma Idempotency-Key ejecutan la saga una sola vez."""
+    import asyncio
+    from httpx import ASGITransport, AsyncClient
+
+    contador_pedidos = 0
+    contador_pagos = 0
+
+    async def mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal contador_pedidos, contador_pagos
+        path = request.url.path
+        if "/v1/productos" in path:
+            return httpx.Response(200, json={"sku": "PROD-CONC", "precio_cop": 15000, "publicado": True})
+        if "/v1/reservas" in path:
+            return httpx.Response(201, json={"reserva_id": "RES-CONC"})
+        if "/v1/pedidos" in path:
+            contador_pedidos += 1
+            await asyncio.sleep(0.05)
+            return httpx.Response(201, json={"pedido_id": "PED-CONC-1", "estado": "CREADO"})
+        if "/v1/pagos" in path:
+            contador_pagos += 1
+            await asyncio.sleep(0.05)
+            return httpx.Response(201, json={"pago_id": "PAG-CONC-1", "estado": "APROBADO"})
+        return httpx.Response(404)
+
+    async def run_concurrent_test():
+        app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(mock_handler))
+
+        payload = {"cliente_id": "CLI-CONC", "sku": "PROD-CONC", "cantidad": 2, "medio_pago": "nequi"}
+        headers = {"Idempotency-Key": "clave-concurrente-test-123"}
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            resp1, resp2 = await asyncio.gather(
+                client.post("/v1/checkout", json=payload, headers=headers),
+                client.post("/v1/checkout", json=payload, headers=headers),
+            )
+
+        assert resp1.status_code == 200
+        assert resp2.status_code == 200
+        assert resp1.json() == resp2.json()
+        assert resp1.json()["estado"] == "CONFIRMADO"
+        assert resp1.json()["pedido_id"] == "PED-CONC-1"
+
+        # Verificación estricta: exactamente UNA creación de pedido y UN cobro
+        assert contador_pedidos == 1
+        assert contador_pagos == 1
+
+    asyncio.run(run_concurrent_test())
 
 
 def test_checkout_falta_idempotency_key_da_422():
