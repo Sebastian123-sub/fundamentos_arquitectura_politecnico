@@ -90,4 +90,4 @@ services:
     <<: *servicio
     build: ./services/api-publica
     ports: ["8000:8000"]
-    environment: {<<: *env, PISHOP_SERVICE_NAME: api-publica, PISHOP_HTTP_PORT: "8000", PISHOP_API_KEY: "${PISHOP_API_KEY:?defina PISHOP_API_KEY en .env}"}
+    environment: {<<: *env, PISHOP_SERVICE_NAME: api-publica, PISHOP_HTTP_PORT: "8000", PISHOP_API_KEY: ${PISHOP_API_KEY:?defina PISHOP_API_KEY en .env}}
