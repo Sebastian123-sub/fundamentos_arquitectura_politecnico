@@ -20,17 +20,67 @@ Servicio compuesto (Backend For Frontend - BFF) que implementa el patrón **Saga
 
 ## Cómo ejecutarlo
 
-### En entorno local (Python)
-```bash
-cd services/checkout-bff
-pip install -r requirements.txt
-python -m uvicorn app.main:app --port 8080 --reload
-python -m pytest -v
-```
+### Requisitos previos
+* **Python 3.10+** (probado y validado en Python 3.13).
+* **Git** instalado.
 
-### Con Docker Compose (desde la raíz)
+---
+
+### Opción 1: Ejecución local con Python (Paso a paso para sustentación)
+
+1. **Clonar el repositorio y ubicarse en la rama de trabajo:**
+   ```bash
+   git clone https://github.com/Sebastian123-sub/fundamentos_arquitectura_politecnico.git
+   cd fundamentos_arquitectura_politecnico
+   git checkout p06-checkout-bff
+   ```
+
+2. **Ingresar a la carpeta del microservicio e instalar dependencias:**
+   ```bash
+   cd services/checkout-bff
+   pip install -r requirements.txt
+   ```
+
+3. **Ejecutar la suite completa de pruebas unitarias (18 pruebas):**
+   ```bash
+   python -m pytest -v
+   ```
+   > Valida la saga completa, compensaciones inversas, timeouts, resiliencia y concurrencia sin requerir servicios externos (100 % pasando).
+
+4. **Ejecutar el script oficial de validación de entrega:**
+   ```bash
+   cd ../..
+   python herramientas/validar_entrega.py checkout-bff
+   ```
+   > Comprueba existencia de rutas OpenAPI, las 3 sondas de salud y ausencia de secretos embebidos (`Resumen: {'checkout-bff': 'OK'}`).
+
+5. **Levantar el servicio en vivo con Uvicorn en el puerto 8080:**
+   ```bash
+   cd services/checkout-bff
+   python -m uvicorn app.main:app --port 8080 --reload
+   ```
+
+6. **Verificar endpoints interactivos en el navegador:**
+   * **Swagger UI interactivo:** [http://localhost:8080/docs](http://localhost:8080/docs)
+   * **Sonda de vida (Liveness):** [http://localhost:8080/health/live](http://localhost:8080/health/live)
+   * **Sonda de preparación (Readiness):** [http://localhost:8080/health/ready](http://localhost:8080/health/ready)
+   * **Sonda de inicio (Startup):** [http://localhost:8080/health/startup](http://localhost:8080/health/startup)
+
+---
+
+### Opción 2: Ejecución con Docker Compose (Integración grupal)
+
+Desde la raíz del proyecto (`fundamentos_arquitectura_politecnico`):
+
 ```bash
-docker compose up -d consul redis postgres checkout-bff
+# Levantar el servicio checkout-bff y sus dependencias de infraestructura
+docker compose up -d checkout-bff
+
+# Ver los logs en tiempo real
+docker compose logs -f checkout-bff
+
+# Detener los contenedores
+docker compose down
 ```
 
 ---
