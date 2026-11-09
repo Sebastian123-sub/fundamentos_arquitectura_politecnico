@@ -56,7 +56,7 @@ Toda la configuración entra por variables de entorno con prefijo `PISHOP_` (Fac
 | `PISHOP_TIMEOUT_PAGOS_SECONDS` | `2.0` | — | Timeout explícito para llamadas a pagos |
 | `PISHOP_HTTP_TIMEOUT_SECONDS` | `2.0` | — | Timeout general de llamadas HTTP |
 
-> **Nota sobre el puerto en Docker Compose:** El contrato del parcial fija el puerto interno en 8080. El Compose lo publica como `8081:8080` en el host para evitar conflicto con el servicio Windows `MTAgentService` del equipo de desarrollo. En producción (o si no hay conflicto) debería ser `8080:8080`. Esta decisión debe confirmarse con P12 (responsable de la infraestructura).
+> **Nota sobre el puerto:** El contrato del parcial fija el puerto estándar en 8080 (`8080:8080`), tanto en ejecución local como en Docker Compose, en estricto cumplimiento con la matriz de puertos de la arquitectura (Semana 2).
 
 ---
 
