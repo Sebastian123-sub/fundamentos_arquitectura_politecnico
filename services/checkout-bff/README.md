@@ -168,30 +168,6 @@ sequenceDiagram
 
 ---
 
-## Decisiones de diseño y justificación para sustentación oral
-
-1. **Orquestación vs. Coreografía**:
-   * *Justificación oral:* Se eligió saga por orquestación porque el checkout requiere una respuesta síncrona inmediata al cliente y permite centralizar la lógica de compensación y reintentos en el BFF sin acoplar los servicios core entre sí.
-2. **ID de correlación (`pedido_id`)**:
-   * *Justificación oral:* El contrato de inventario exige `pedido_id` en el paso 2 pero pedidos genera su identificador en el paso 3; el BFF genera un UUID de correlación para la reserva y lo asocia luego al pedido para desacoplar ambos contratos.
-3. **Almacenamiento de idempotencia y concurrencia**:
-   * *Justificación oral:* Se implementa caché en memoria protegida por bloqueos concurrentes (`asyncio.Lock` por clave) para garantizar que dos peticiones simultáneas con la misma cabecera no dupliquen cobros ni reservas sin requerir base de datos externa no provista al BFF.
-4. **Timeouts explícitos individuales**:
-   * *Justificación oral:* Cada servicio downstream tiene configurado su propio timeout (2.0 s) a través de un único `httpx.AsyncClient` reutilizable en el lifespan, previniendo el agotamiento de sockets y asegurando que un servicio lento o caído no bloquee el hilo.
-5. **Degradación graciosa en vitrina (`/v1/vitrina`)**:
-   * *Justificación oral:* Si inventario no responde para un producto publicado, se entrega con stock en 0 en lugar de tumbar la respuesta completa para el móvil, priorizando la disponibilidad sobre la consistencia estricta.
-6. **Pago RECHAZADO vs. PENDIENTE**:
-   * *Justificación oral:* RECHAZADO significa que la pasarela nunca realizó el cobro, por lo que no se llama al reembolso (no hay dinero que devolver). PENDIENTE es ambiguo; se trata conservadoramente como fallo con reembolso para evitar cobros dobles al reintentar.
-
-### Debilidades conocidas (documentadas honestamente)
-
-* **Pérdida de `pago_id`/`pedido_id` en timeout**: Si el servicio de pagos o pedidos responde lento y supera el timeout, el BFF no obtiene el ID generado y no puede compensar ese paso directamente. Mitigación: el cliente puede reintentar con la **misma `Idempotency-Key` derivada** (`{clave}-pago` o `{clave}-reserva`), que el servicio downstream debe descartar por idempotencia.
-* **Idempotencia en memoria**: El `IDEMPOTENCIA_STORE` vive en RAM y se pierde al reiniciar el proceso o al escalar horizontalmente. En producción debería persistirse en Redis o base de datos.
-* **Saga fallida bloqueada por clave**: Una saga que falla por error transitorio queda almacenada como `FALLIDO` para esa clave de idempotencia. Para reintentar se debe usar una **clave nueva**; la clave usada no se puede reutilizar.
-* **Locks no distribuidos**: Los `asyncio.Lock` por clave garantizan concurrencia dentro de un proceso, pero no entre réplicas. Con múltiples instancias podría haber duplicados hasta implementar locks en Redis.
-
----
-
 ## Evidencia reproducible
 
 ### 1. Ejecución de pruebas unitarias (`pytest -q`)
@@ -256,7 +232,7 @@ En cumplimiento de la política de transparencia académica del curso (secciones
 * **Qué parte se apoyó con IA:**
   - Diseño de la estructura del orquestador de saga, lógica de compensaciones en reversa y la distinción RECHAZADO/PENDIENTE en `app/saga.py`.
   - Configuración de la suite de pruebas unitarias con dobles `httpx.MockTransport` en `tests/test_saga.py` (incluyendo prueba de concurrencia con `asyncio.gather` y `ASGITransport`) y `tests/test_vitrina.py`.
-  - Elaboración del diagrama de secuencias Mermaid, tabla de configuración y secciones de decisiones y debilidades en este `README.md`.
+  - Elaboración del diagrama de secuencias Mermaid, tabla de configuración y tabla de términos de arquitectura en este `README.md`.
   - Corrección de URLs en `docker-compose.yml` para que el BFF encuentre los servicios downstream dentro de la red Docker.
 * **Qué verifiqué y ejecuté personalmente:**
   - Ejecución y aprobación del 100 % de las pruebas unitarias: `python3.13 -m pytest services/checkout-bff/tests -q` → **18 passed**.
