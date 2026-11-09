@@ -101,6 +101,23 @@ sequenceDiagram
 
 ---
 
+## Tabla de Términos de Arquitectura
+
+| Término | Definición y Propósito en el Parcial | Aplicación en `checkout-bff` (P06) |
+|---|---|---|
+| **BFF (Backend For Frontend)** | Patrón de arquitectura donde un servicio intermedio adapta y optimiza las respuestas para un cliente específico (ej. móvil), agregando múltiples llamadas de backend. | El endpoint `/v1/vitrina` consulta catálogo y stock de inventario, devolviendo únicamente los 4 campos que el cliente móvil necesita. |
+| **Saga por Orquestación** | Patrón para transacciones distribuidas donde un coordinador central (orquestador) invoca secuencialmente los servicios participantes y gestiona las fallas. | El BFF coordina los 4 pasos: Catálogo → Inventario → Pedidos → Pagos, centralizando el flujo y la lógica de compensación sin acoplar los servicios core. |
+| **Transacción Compensatoria** | Operación semántica inversa que revierte los efectos secundarios de un paso completado previamente cuando un paso posterior de la saga falla. | Si el cobro o la pasarela falla, el BFF ejecuta las compensaciones en orden inverso: cancela el pedido creado y libera la reserva de inventario. |
+| **Idempotencia (`Idempotency-Key`)** | Propiedad de una operación que garantiza que invocarla múltiples veces con la misma clave produce el mismo resultado sin efectos secundarios adicionales. | Cabecera obligatoria en `POST /v1/checkout`. Peticiones duplicadas devuelven la respuesta en memoria sin volver a cobrar ni duplicar pedidos. |
+| **ID de Correlación (`correlation_id`)** | Identificador único generado al inicio de una transacción distribuida para rastrear y enlazar entidades entre microservicios independientes. | Como inventario exige `pedido_id` en el paso 2 pero pedidos se crea en el paso 3, el BFF genera un UUID de correlación temporal que asocia la reserva. |
+| **Degradación Graciosa (Graceful Degradation)** | Capacidad de un sistema de mantener operatividad parcial entregando una respuesta controlada cuando una dependencia downstream falla. | En `/v1/vitrina`, si inventario no responde para un SKU, se entrega con stock en 0 en lugar de tumbar la respuesta completa con un HTTP 500. |
+| **Twelve-Factor App (Factor III)** | Metodología de aplicaciones en la nube que exige desacoplar estrictamente la configuración del código fuente mediante variables de entorno. | Toda la configuración del BFF entra por variables `PISHOP_*`, utilizando `pydantic-settings` y protegiendo secretos con `SecretStr`. |
+| **Sondas de Salud (Health Probes)** | Endpoints que permiten a la infraestructura de orquestación supervisar el ciclo de vida del microservicio de forma diferenciada. | `/health/live` (proceso vivo, nunca toca dependencias), `/health/ready` (listo para tráfico), `/health/startup` (arranque del proceso completado). |
+| **Bloqueo Concurrente (`asyncio.Lock`)** | Mecanismo de exclusión mutua asíncrona para prevenir condiciones de carrera ante múltiples peticiones simultáneas sobre el mismo recurso. | Bloqueo por clave de idempotencia que garantiza que dos peticiones idénticas concurrentes ejecuten la saga una sola vez. |
+| **Timeout Explícito** | Límite máximo de espera configurado individualmente en clientes HTTP para evitar sockets colgados ante servicios lentos o caídos. | Cada llamada saliente usa un timeout individual de 2.0 s por servicio downstream (`catalogo`, `inventario`, `pedidos`, `pagos`) con `httpx.AsyncClient`. |
+
+---
+
 ## Decisiones de diseño y justificación para sustentación oral
 
 1. **Orquestación vs. Coreografía**:
